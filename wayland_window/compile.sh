@@ -3,4 +3,4 @@
 
 # /home/osten/Documents/RandomSideCodes/RandomSideQuests
 
-time gcc wayland_window/main.c wayland_window/xdg-shell-protocol.c -o testing -g -O0 -Wall -lwayland-client
+time gcc  wayland_window/main.c wayland_window/xdg-shell-protocol.c -o testing -g -O0 -Wall -lwayland-client

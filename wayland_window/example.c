@@ -1,52 +1,59 @@
 #define _POSIX_C_SOURCE 200112L
+#include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <stdbool.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/syscall.h>
+#include <time.h>
+#include <unistd.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
-long long my_ftruncate(int fd, long length) {
-    long ret;
-
-    asm volatile (
-        "syscall"
-        : "=a"(ret)
-        : "a"(SYS_ftruncate), "D"(fd), "S"(length)
-        : "rcx", "r11", "memory"
-    );
-
-    return ret;
+/* Shared memory support code */
+static void randname(char *buf){
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    long r = ts.tv_nsec;
+    for (int i = 0; i < 6; ++i) {
+        buf[i] = 'A'+(r&15)+(r&16)*2;
+        r >>= 5;
+    }
 }
 
-static int create_shared_mem_file(void){
-
-    char name[] = "SharedFileMemory";
-    int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
-    if (fd >= 0) {
-        shm_unlink(name);
-        return fd;
-    }
+static int create_shm_file(void){
+    int retries = 100;
+    do {
+        char name[] = "/wl_shm-XXXXXX";
+        randname(name + sizeof(name) - 7);
+        --retries;
+        int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) {
+            shm_unlink(name);
+            return fd;
+        }
+    } while (retries > 0 && errno == EEXIST);
     return -1;
 }
 
-static int allocate_shared_mem_file(size_t size){
-    int fd = create_shared_mem_file();
+static int allocate_shm_file(size_t size){
+    int fd = create_shm_file();
     if (fd < 0){
         return -1;
     }
-
-    int ret = my_ftruncate(fd, size);//ftruncate(fd, size);
-
+    int ret;
+    do {
+        ret = ftruncate(fd, size);
+    } while (ret < 0 && errno == EINTR);
     if (ret < 0) {
-        shm_unlink("SharedFileMemory");
+        close(fd);
         return -1;
     }
     return fd;
 }
 
 /* Wayland code */
-struct ClientState {
+struct client_state {
     /* Globals */
     struct wl_display *wl_display;
     struct wl_registry *wl_registry;
@@ -68,12 +75,12 @@ static const struct wl_buffer_listener wl_buffer_listener = {
     .release = wl_buffer_release,
 };
 
-static struct wl_buffer * draw_frame(struct ClientState *state){
+static struct wl_buffer * draw_frame(struct client_state *state){
     const int width = 640, height = 480;
     int stride = width * 4;
     int size = stride * height;
 
-    int fd = allocate_shared_mem_file(size);
+    int fd = allocate_shm_file(size);
 
     if (fd == -1) {
         return NULL;
@@ -82,12 +89,14 @@ static struct wl_buffer * draw_frame(struct ClientState *state){
     uint32_t *data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 
     if (data == MAP_FAILED) {
+        close(fd);
         return NULL;
     }
 
     struct wl_shm_pool *pool = wl_shm_create_pool(state->wl_shm, fd, size);
     struct wl_buffer *buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);
+    close(fd);
 
     /* Draw checkerboxed background */
     for (int y = 0; y < height; ++y) {
@@ -107,7 +116,7 @@ static struct wl_buffer * draw_frame(struct ClientState *state){
 }
 
 static void xdg_surface_configure(void *data, struct xdg_surface *xdg_surface, uint32_t serial){
-    struct ClientState *state = data;
+    struct client_state *state = data;
     struct wl_buffer *buffer = draw_frame(state);
 
     xdg_surface_ack_configure(xdg_surface, serial);
@@ -125,7 +134,7 @@ static const struct xdg_wm_base_listener xdg_wm_base_listener = {
 };
 
 static void registry_global(void *data, struct wl_registry *wl_registry, uint32_t name, const char *interface, uint32_t version){
-    struct ClientState *state = data;
+    struct client_state *state = data;
     if (strcmp(interface, wl_shm_interface.name) == 0) {
         state->wl_shm = wl_registry_bind(wl_registry, name, &wl_shm_interface, 1);
     }
@@ -153,7 +162,7 @@ int main(){
         .global_remove = registry_global_remove,
     };
 
-    struct ClientState state = { 0 };
+    struct client_state state = { 0 };
     state.wl_display = wl_display_connect(NULL);
     state.wl_registry = wl_display_get_registry(state.wl_display);
     wl_registry_add_listener(state.wl_registry, &wl_registry_listener, &state);
