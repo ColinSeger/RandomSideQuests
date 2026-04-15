@@ -5,7 +5,21 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <wayland-client.h>
+#include <stdio.h>
 #include "xdg-shell-client-protocol.h"
+
+struct ClientState {
+    struct wl_shm* wl_shm;
+    struct wl_compositor* wl_compositor;
+    struct xdg_wm_base* xdg_wm_base;
+
+    struct wl_surface* wl_surface;
+    const struct wl_buffer_listener wl_buffer_listener;
+
+    struct xdg_surface* xdg_surface;
+    struct xdg_toplevel* xdg_toplevel;
+    const struct xdg_wm_base_listener xdg_wm_base_listener;
+};
 
 static inline int64_t my_ftruncate(int32_t fd, uint64_t length) {
     int64_t ret;
@@ -38,55 +52,45 @@ static inline uint32_t allocate_shared_mem_file(char* name, uint64_t size){
     return fd;
 }
 
-struct ClientState {
-    struct wl_shm* wl_shm;
-    struct wl_compositor* wl_compositor;
-    struct xdg_wm_base* xdg_wm_base;
-    /* Objects */
-    struct wl_surface* wl_surface;
-    struct xdg_surface* xdg_surface;
-    struct xdg_toplevel* xdg_toplevel;
-};
-
 static void wl_buffer_release(void* data, struct wl_buffer* wl_buffer){
     /* Sent by the compositor when it's no longer using this buffer */
     wl_buffer_destroy(wl_buffer);
 }
 
-static const struct wl_buffer_listener wl_buffer_listener = {
-    .release = wl_buffer_release,
-};
-
-
-static inline uint32_t window_resize()
-{
+static inline uint32_t window_resize(){
     return 0;
 }
 
-
-static inline struct wl_buffer* draw_frame(struct ClientState* state){
+static inline struct wl_buffer* create_wayland_buffer(struct ClientState* state, uint32_t* fd){
     const uint32_t width = 640;
     const uint32_t height = 480;
     uint32_t stride = width * 4;
     uint32_t size = stride * height;
 
-    uint32_t fd = allocate_shared_mem_file("SharedFileMemory", size);
+    *fd = allocate_shared_mem_file("SharedFileMemory", size);
 
-    if (!fd) {
+    if (!*fd) {
         return 0;
     }
 
-    uint32_t* data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-
-    if (data == MAP_FAILED) {
-        return 0;
-    }
-
-    struct wl_shm_pool* pool = wl_shm_create_pool(state->wl_shm, fd, size);
+    struct wl_shm_pool* pool = wl_shm_create_pool(state->wl_shm, *fd, size);
     struct wl_buffer* buffer = wl_shm_pool_create_buffer(pool, 0, width, height, stride, WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);
 
-    /* Draw checkerboxed background */
+    wl_buffer_add_listener(buffer, &state->wl_buffer_listener, NULL);
+
+    return buffer;
+}
+
+static inline void draw_frame(uint32_t width, uint32_t height, uint32_t fd){
+    uint32_t stride = width * 4;
+    uint32_t size = stride * height;
+    uint32_t* data = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+
+    if (data == MAP_FAILED) {
+        return;
+    }
+
     for (int y = 0; y < height; y++) {
         for (int x = 0; x < width; x++) {
             if ((x + y / 8 * 8) % 16 < 8){
@@ -97,17 +101,16 @@ static inline struct wl_buffer* draw_frame(struct ClientState* state){
             }
         }
     }
-
-    munmap(data, size);
-    wl_buffer_add_listener(buffer, &wl_buffer_listener, NULL);
-    return buffer;
 }
 
 static inline void xdg_surface_configure(void* data, struct xdg_surface* xdg_surface, uint32_t serial){
     struct ClientState* state = data;
-    struct wl_buffer* buffer = draw_frame(state);
+    uint32_t fd = 0;
+    struct wl_buffer* buffer = create_wayland_buffer(state, &fd);
 
     if(!buffer) return;
+
+    draw_frame(640, 480, fd);
 
     xdg_surface_ack_configure(xdg_surface, serial);
     wl_surface_attach(state->wl_surface, buffer, 0, 0);
@@ -118,10 +121,6 @@ static inline void xdg_surface_configure(void* data, struct xdg_surface* xdg_sur
 static inline void xdg_wm_base_ping(void* data, struct xdg_wm_base* xdg_wm_base, uint32_t serial){
     xdg_wm_base_pong(xdg_wm_base, serial);
 }
-
-static const struct xdg_wm_base_listener xdg_wm_base_listener = {
-    .ping = xdg_wm_base_ping,
-};
 
 static inline void registry_global(void* data, struct wl_registry* wl_registry, uint32_t name, const char* interface, uint32_t version){
     struct ClientState* state = data;
@@ -134,7 +133,7 @@ static inline void registry_global(void* data, struct wl_registry* wl_registry, 
     else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         state->xdg_wm_base = wl_registry_bind(wl_registry, name, &xdg_wm_base_interface, 1);
 
-        xdg_wm_base_add_listener(state->xdg_wm_base, &xdg_wm_base_listener, state);
+        xdg_wm_base_add_listener(state->xdg_wm_base, &state->xdg_wm_base_listener, state);
     }
 }
 
@@ -155,7 +154,10 @@ int main(){
     struct wl_display* wl_display = wl_display_connect(NULL);
     struct wl_registry* wl_registry = wl_display_get_registry(wl_display);
 
-    struct ClientState state = { 0 };
+    struct ClientState state = {
+        .wl_buffer_listener.release = wl_buffer_release,
+        .xdg_wm_base_listener.ping = xdg_wm_base_ping,
+    };
 
     wl_registry_add_listener(wl_registry, &wl_registry_listener, &state);
     wl_display_roundtrip(wl_display);
@@ -171,6 +173,7 @@ int main(){
 
     while (wl_display_dispatch(wl_display)) {
         /* This space deliberately left blank */
+        printf("Test");
     }
 
     return 0;
